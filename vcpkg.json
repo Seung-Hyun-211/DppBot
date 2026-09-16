@@ -1,0 +1,8 @@
+{
+    "dependencies": [
+        "dpp",
+        "nlohmann-json",
+        "openssl",
+        "pthreads"
+    ]
+}

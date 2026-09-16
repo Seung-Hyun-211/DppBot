@@ -5,12 +5,19 @@ client_secret.json
 
 # 빌드 산출물
 build/
+build-linux/
 vcpkg/
 vcpkg_installed/
 .vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
 *.exe
 *.o
 *.obj
+*.pdb
+*.ilk
 
 # Go 서버 빌드 산출물
 server/Go-Local
