@@ -15,13 +15,14 @@ struct GuildInfo {
     dpp::snowflake voiceChannelId;
     std::atomic<bool> skipRequested;
     std::atomic<bool> shouldStop;
+    std::atomic<bool> repeatCurrent;
     std::thread audioThread;
     std::mutex listMutex;
 
-    GuildInfo() : vconn(nullptr), voiceChannelId(0), skipRequested(false), shouldStop(false) {}
+    GuildInfo() : vconn(nullptr), voiceChannelId(0), skipRequested(false), shouldStop(false), repeatCurrent(false) {}
 
     GuildInfo(dpp::voiceconn* vconn, dpp::snowflake voiceChannelId)
-        : vconn(vconn), voiceChannelId(voiceChannelId), skipRequested(false), shouldStop(false) {}
+        : vconn(vconn), voiceChannelId(voiceChannelId), skipRequested(false), shouldStop(false), repeatCurrent(false) {}
 
     // 복사 생성자/대입 삭제 (스레드는 복사할 수 없음)
     GuildInfo(const GuildInfo&) = delete;
@@ -36,6 +37,7 @@ struct GuildInfo {
           voiceChannelId(other.voiceChannelId),
           skipRequested(other.skipRequested.load()),
           shouldStop(other.shouldStop.load()),
+          repeatCurrent(other.repeatCurrent.load()),
           audioThread(std::move(other.audioThread)) {}
 
     ~GuildInfo() {
@@ -63,6 +65,8 @@ private:
     void HandleRandomCommand(const dpp::message_create_t& event);
     void HandleRemoveCommand(const dpp::message_create_t& event);
     void HandleDeleteCommand(const dpp::message_create_t& event, bool shouldSkip = false);
+    void HandleRepeatCommand(const dpp::message_create_t& event);
+    void HandleCleanCommand(const std::string& args, const dpp::message_create_t& event);
 
     // 검색어/URL을 서버 /process로 보내고, 응답(단일 곡 또는 플레이리스트)을 재생 큐에 추가한다.
     void RequestAndEnqueue(const std::string& query, const dpp::message_create_t& event, bool insertFront);

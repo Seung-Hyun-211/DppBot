@@ -72,6 +72,11 @@ void DiscordBotClient::HandleCommand(const std::string& command, const dpp::mess
         bool shouldSkip = args.find('s') != std::string::npos;
         HandleDeleteCommand(event, shouldSkip);
         DeleteMessage(event.msg.id, event.msg.channel_id);
+    } else if (lowerCommand == "repeat") {
+        HandleRepeatCommand(event);
+        DeleteMessage(event.msg.id, event.msg.channel_id);
+    } else if (lowerCommand == "clean" || lowerCommand.rfind("clean ", 0) == 0) {
+        HandleCleanCommand(argsAfterFirstSpace(), event);
     }
 }
 
@@ -296,6 +301,19 @@ void DiscordBotClient::HandleSkipCommand(const dpp::message_create_t& event) {
         it->second.skipRequested = true;
     }
     SendBotMessage(event.msg.channel_id, "넘김");
+}
+
+void DiscordBotClient::HandleRepeatCommand(const dpp::message_create_t& event) {
+    std::lock_guard<std::mutex> lock(guildInfosMutex);
+    auto it = guildInfos.find(event.msg.guild_id);
+    if (it == guildInfos.end()) {
+        SendBotMessage(event.msg.channel_id, "채널 스레드가 존재하지 않음.");
+        return;
+    }
+
+    bool nowRepeating = !it->second.repeatCurrent.load();
+    it->second.repeatCurrent = nowRepeating;
+    SendBotMessage(event.msg.channel_id, nowRepeating ? "반복 재생 켜짐" : "반복 재생 꺼짐");
 }
 
 void DiscordBotClient::HandleRandomCommand(const dpp::message_create_t& event) {
@@ -541,6 +559,7 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
             std::cout << "[PlayAudioThread] Playing: " << filePathToPlay << std::endl;
 
             FILE* pipe = FileLoader::GetAudioStream(filePathToPlay);
+            bool finishedNaturally = false;
             if (pipe) {
                 std::vector<uint8_t> buffer(FRAME_SIZE);
                 uint32_t waitTime = 0;
@@ -556,7 +575,10 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
                     }
 
                     size_t bytesRead = fread(buffer.data(), 1, buffer.size(), pipe);
-                    if (bytesRead == 0) break;
+                    if (bytesRead == 0) {
+                        finishedNaturally = true;
+                        break;
+                    }
                     if (bytesRead % 2 != 0) bytesRead--;
                     if (!v || !vconn || !v->is_ready()) break;
 
@@ -578,10 +600,15 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
                 std::cerr << "[PlayAudioThread] 파일 열기 실패: " << filePathToPlay << std::endl;
             }
 
-            std::lock_guard<std::mutex> lock(guildInfosMutex);
-            auto it = guildInfos.find(guildId);
-            if (it != guildInfos.end()) {
-                it->second.currentPlay = VideoDbInfo();
+            // 자연 종료(끝까지 다 재생)이고 반복 모드면 currentPlay를 그대로 둬서 다음 바퀴에 같은 파일을 다시 연다.
+            // 스킵/정지/에러로 끝난 경우는 반복 여부와 무관하게 항상 다음 곡으로 넘어간다.
+            bool shouldRepeat = finishedNaturally && guildInfo->repeatCurrent.load();
+            if (!shouldRepeat) {
+                std::lock_guard<std::mutex> lock(guildInfosMutex);
+                auto it = guildInfos.find(guildId);
+                if (it != guildInfos.end()) {
+                    it->second.currentPlay = VideoDbInfo();
+                }
             }
         } else {
             if (v && vconn && v->is_ready()) {
@@ -626,6 +653,63 @@ void DiscordBotClient::StopAudioThread(dpp::snowflake guildId) {
 }
 
 // ================= 메시지 유틸 =================
+
+// 현재 채널의 최근 메시지를 count개 지운다 (요청한 !clean 메시지 자신도 포함해서 지워짐).
+// Discord API 제약: 벌크 삭제는 한 번에 2~100개까지만 가능하고, 2주보다 오래된 메시지는 지울 수 없다.
+void DiscordBotClient::HandleCleanCommand(const std::string& args, const dpp::message_create_t& event) {
+    int count = 10;
+    if (!args.empty()) {
+        try {
+            count = std::stoi(args);
+        } catch (...) {
+            count = 10;
+        }
+    }
+    if (count <= 0) count = 10;
+    if (count > 100) count = 100; // Discord 벌크 삭제 한도
+
+    dpp::snowflake channelId = event.msg.channel_id;
+
+    bot.messages_get(channelId, 0, 0, 0, static_cast<uint64_t>(count),
+        [this, channelId](const dpp::confirmation_callback_t& callback) {
+            if (callback.is_error()) {
+                std::cerr << "[HandleCleanCommand] messages_get 실패: " << callback.get_error().message << std::endl;
+                SendBotMessage(channelId, "메시지를 가져오는 데 실패했습니다 (권한 부족일 수 있음).");
+                return;
+            }
+
+            auto messages = std::get<dpp::message_map>(callback.value);
+            if (messages.empty()) {
+                return;
+            }
+
+            std::vector<dpp::snowflake> ids;
+            ids.reserve(messages.size());
+            for (const auto& entry : messages) {
+                ids.push_back(entry.first);
+            }
+
+            for (size_t offset = 0; offset < ids.size(); offset += 100) {
+                size_t end = std::min(offset + static_cast<size_t>(100), ids.size());
+                std::vector<dpp::snowflake> chunk(ids.begin() + offset, ids.begin() + end);
+
+                if (chunk.size() == 1) {
+                    bot.message_delete(chunk[0], channelId, [](const dpp::confirmation_callback_t&) {});
+                } else {
+                    bot.message_delete_bulk(chunk, channelId, [channelId](const dpp::confirmation_callback_t& cb) {
+                        if (cb.is_error()) {
+                            // 2주보다 오래된 메시지가 섞여있으면 여기서 실패할 수 있음 - 로그만 남김
+                            std::cerr << "[HandleCleanCommand] bulk delete 실패 (channel " << channelId
+                                      << "): " << cb.get_error().message << std::endl;
+                        }
+                    });
+                }
+            }
+
+            std::cout << "[HandleCleanCommand] " << ids.size() << "개 메시지 삭제 요청 (channel " << channelId << ")" << std::endl;
+        }
+    );
+}
 
 void DiscordBotClient::SendBotMessage(const dpp::snowflake& msgChannelId, const std::string& message) {
     dpp::snowflake lastMessageId = 0;
