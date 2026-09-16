@@ -90,6 +90,24 @@ echo ""
 # 의존성 설치
 echo "[3/5] 의존성 설치 중..."
 if [ ! -d "vcpkg_installed/x64-linux" ]; then
+    # 메모리가 적은 환경에서 vcpkg가 코어 수만큼 병렬 컴파일하다가 OOM으로 죽는 것을 방지.
+    # 컴파일 작업 하나당 대략 1.5GB로 잡고, CPU 코어 수를 넘지 않게 제한한다.
+    if [ -z "$VCPKG_MAX_CONCURRENCY" ] && command -v free &> /dev/null; then
+        MEM_MB=$(free -m | awk '/^Mem:/{print $2}')
+        if [ -n "$MEM_MB" ] && [ "$MEM_MB" -gt 0 ]; then
+            JOBS=$(( MEM_MB / 1536 ))
+            [ "$JOBS" -lt 1 ] && JOBS=1
+            CPU_JOBS=$(nproc)
+            [ "$JOBS" -gt "$CPU_JOBS" ] && JOBS=$CPU_JOBS
+            export VCPKG_MAX_CONCURRENCY=$JOBS
+            echo "메모리(${MEM_MB}MB) 기준으로 빌드 병렬도를 ${JOBS}로 제한합니다 (OOM 방지)."
+            if [ "$MEM_MB" -lt 2048 ]; then
+                echo "경고: 메모리가 2GB 미만입니다. openssl/dpp 빌드 중 OOM이 날 수 있습니다."
+                echo "      스왑을 추가하는 걸 권장합니다: sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile"
+            fi
+        fi
+    fi
+
     echo "의존성을 설치하는 중... (시간이 오래 걸릴 수 있습니다: 10-30분)"
     ./vcpkg/vcpkg install --triplet x64-linux
     echo "✓ 의존성 설치 완료"
