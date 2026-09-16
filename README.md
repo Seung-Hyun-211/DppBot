@@ -9,7 +9,12 @@
 
 ## 상태
 
-설계 단계. 구현 방향은 [DESIGN.md](DESIGN.md)에 정리되어 있다.
+서버(`server/`) 구현 완료. 클라이언트(`src/`)는 아직 작업 전.
+
+## 구조
+
+- [`server/`](server/) — Go 서버. 실행/API 사용법은 [server/README.md](server/README.md) 참고
+- `src/` — C++ 클라이언트 (작업 예정)
 
 ## 요구사항
 

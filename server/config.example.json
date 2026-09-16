@@ -1,0 +1,12 @@
+{
+    "ApiKey": "YOUR_YOUTUBE_DATA_API_KEY",
+    "ApplicationName": "DppBot",
+    "Database": {
+        "Host": "127.0.0.1",
+        "Port": 3306,
+        "User": "your_mysql_user",
+        "Password": "your_mysql_password",
+        "Database": "your_database_name"
+    },
+    "Port": ":8080"
+}
