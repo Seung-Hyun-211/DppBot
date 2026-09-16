@@ -655,7 +655,8 @@ void DiscordBotClient::StopAudioThread(dpp::snowflake guildId) {
 // ================= 메시지 유틸 =================
 
 // 현재 채널의 최근 메시지를 count개 지운다 (요청한 !clean 메시지 자신도 포함해서 지워짐).
-// Discord API 제약: 벌크 삭제는 한 번에 2~100개까지만 가능하고, 2주보다 오래된 메시지는 지울 수 없다.
+// count는 최대 10개까지만 허용 (그 이상이면 삭제하지 않고 안내 메시지만 보냄).
+// Discord API 제약: 2주보다 오래된 메시지는 벌크 삭제할 수 없다.
 void DiscordBotClient::HandleCleanCommand(const std::string& args, const dpp::message_create_t& event) {
     int count = 10;
     if (!args.empty()) {
@@ -666,9 +667,13 @@ void DiscordBotClient::HandleCleanCommand(const std::string& args, const dpp::me
         }
     }
     if (count <= 0) count = 10;
-    if (count > 100) count = 100; // Discord 벌크 삭제 한도
 
     dpp::snowflake channelId = event.msg.channel_id;
+
+    if (count > 10) {
+        SendBotMessage(channelId, "10개 이상은 삭제할 수 없습니다.");
+        return;
+    }
 
     bot.messages_get(channelId, 0, 0, 0, static_cast<uint64_t>(count),
         [this, channelId](const dpp::confirmation_callback_t& callback) {
