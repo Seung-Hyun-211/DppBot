@@ -24,6 +24,9 @@ vcpkg_installed/
 server/Go-Local
 server/Go-Local-linux
 
+# 실행 로그
+server.log
+
 # OS / 에디터
 .DS_Store
 Thumbs.db

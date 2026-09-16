@@ -21,24 +21,34 @@
 - **클라이언트**: C++17, CMake 3.20+, [dpp](https://github.com/brainboxdotcc/DPP), OpenSSL
 - **서버**: Go 1.24+, MySQL, YouTube Data API v3 키, `yt-dlp`, `ffmpeg`
 
-## 빌드
-
-```bash
-# vcpkg로 의존성 설치 후
-cmake -B build-linux -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build-linux
-```
-
-또는 `./auto-build.sh` (패키지 설치부터 빌드까지 한 번에), `./build.sh`, `./quick-build.sh`, `./clean-build.sh` 참고.
-
-서버는 [server/README.md](server/README.md)의 빌드 방법을 따른다.
-
 ## 설정
 
-클라이언트는 `config.json`(루트, `discord_token`), 서버는 `server/config.json`을 각각 필요로 한다.
-`config.example.json` / `server/config.example.json`을 복사해 실제 값으로 채운다.
+먼저 `config.example.json` → `config.json`(루트, `discord_token`), `server/config.example.json` → `server/config.json`을 복사해 실제 값으로 채운다.
 
 **이 `config.json` 파일들은 `.gitignore`로 커밋에서 제외된다 — 절대 저장소에 올리지 않는다.**
+
+## 빌드 + 실행 (한 번에)
+
+```bash
+./build-all.sh   # 클라이언트(vcpkg + CMake) + 서버(go build) 한 번에 빌드
+./run-all.sh     # 서버를 백그라운드로 띄우고 클라이언트 실행, 종료 시 서버도 같이 정리
+```
+
+`run-all.sh`는 `config.json`이 준비돼 있는지, 빌드가 끝났는지 확인하고, 서버가 응답할 때까지 기다린 뒤 클라이언트를 시작한다. `yt-dlp`/`ffmpeg`가 PATH에 없으면 경고만 출력하고 계속 진행한다.
+
+### 따로 빌드하고 싶을 때
+
+```bash
+# 클라이언트만
+cmake -B build-linux -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build-linux
+# 또는 ./auto-build.sh, ./build.sh, ./quick-build.sh, ./clean-build.sh
+
+# 서버만
+cd server && go build -o Go-Local .
+```
+
+서버 API 사용법은 [server/README.md](server/README.md) 참고.
 
 ## 문서
 
