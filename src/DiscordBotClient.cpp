@@ -589,7 +589,7 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
                         break;
                     }
 
-                    std::this_thread::sleep_for(std::chrono::milliseconds(59));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(58));
                     waitTime += 1;
                 }
 
