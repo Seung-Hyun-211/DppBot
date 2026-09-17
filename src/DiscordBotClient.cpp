@@ -90,7 +90,7 @@ GuildInfo& DiscordBotClient::EnsureGuildInfo(dpp::snowflake guildId, dpp::discor
 
     dpp::voiceconn* vconn = shard ? shard->get_voice(guildId) : nullptr;
     dpp::snowflake voiceChannelId = (vconn && vconn->channel_id != dpp::snowflake(0)) ? vconn->channel_id : dpp::snowflake(0);
-    auto result = guildInfos.emplace(guildId, GuildInfo(vconn, voiceChannelId));
+    auto result = guildInfos.emplace(guildId, GuildInfo(shard, voiceChannelId));
     return result.first->second;
 }
 
@@ -444,15 +444,16 @@ void DiscordBotClient::HandleJoinCommand(const dpp::message_create_t& event) {
         // 스레드를 멈추기 전에 연결을 끊으면 use-after-free 위험이 있다.
         StopAudioThread(event.msg.guild_id);
 
-        std::lock_guard<std::mutex> lock(guildInfosMutex);
-        auto it = guildInfos.find(event.msg.guild_id);
-        if (it != guildInfos.end()) {
-            if (it->second.vconn && it->second.vconn->voiceclient && it->second.vconn->voiceclient->is_ready()) {
-                it->second.vconn->voiceclient->stop_audio();
-                it->second.vconn->disconnect();
-            }
-            guildInfos.erase(it);
+        // 캐싱된 값 대신 shard에서 지금 시점의 voiceconn을 다시 조회한다 (dpp가 그 사이
+        // 내부적으로 재연결하면서 이전 객체를 없앴을 수 있음).
+        dpp::voiceconn* existingVconn = event.from()->get_voice(event.msg.guild_id);
+        if (existingVconn && existingVconn->voiceclient && existingVconn->voiceclient->is_ready()) {
+            existingVconn->voiceclient->stop_audio();
+            existingVconn->disconnect();
         }
+
+        std::lock_guard<std::mutex> lock(guildInfosMutex);
+        guildInfos.erase(event.msg.guild_id);
     }
 
     event.from()->disconnect_voice(event.msg.guild_id);
@@ -464,7 +465,7 @@ void DiscordBotClient::HandleJoinCommand(const dpp::message_create_t& event) {
             {
                 std::lock_guard<std::mutex> lock(guildInfosMutex);
                 guildInfos.erase(event.msg.guild_id);
-                guildInfos.emplace(event.msg.guild_id, GuildInfo(vconn, voiceChannelId));
+                guildInfos.emplace(event.msg.guild_id, GuildInfo(event.from(), voiceChannelId));
             }
             StartAudioThread(event.msg.guild_id);
         }
@@ -499,11 +500,7 @@ void DiscordBotClient::HandleLeaveCommand(const dpp::message_create_t& event) {
     }
 
     std::lock_guard<std::mutex> lock(guildInfosMutex);
-    auto it = guildInfos.find(guildId);
-    if (it != guildInfos.end()) {
-        it->second.vconn = nullptr;
-        guildInfos.erase(it);
-    }
+    guildInfos.erase(guildId);
 }
 
 // ================= 오디오 재생 스레드 =================
@@ -522,7 +519,8 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
             guildInfo = &it->second;
         }
 
-        dpp::voiceconn* vconn = guildInfo->vconn;
+        dpp::discord_client* shard = guildInfo->shard;
+        dpp::voiceconn* vconn = shard ? shard->get_voice(guildId) : nullptr;
         dpp::discord_voice_client* v = (vconn && vconn->voiceclient) ? vconn->voiceclient.get() : nullptr;
 
         if (!vconn || !v || !v->is_ready()) {
@@ -580,10 +578,16 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
                         break;
                     }
                     if (bytesRead % 2 != 0) bytesRead--;
-                    if (!v || !vconn || !v->is_ready()) break;
+
+                    // 매 프레임마다 다시 조회한다. dpp가 내부적으로 음성 재연결(voiceconn 교체)을
+                    // 하는 동안 바깥에서 캐싱해둔 포인터를 계속 쓰면 use-after-free로 세그폴트가
+                    // 난다 - 실제로 "Starting a full reconnection" 로그 직후 크래시가 발생했었음.
+                    dpp::voiceconn* liveVconn = shard ? shard->get_voice(guildId) : nullptr;
+                    dpp::discord_voice_client* liveV = (liveVconn && liveVconn->voiceclient) ? liveVconn->voiceclient.get() : nullptr;
+                    if (!liveV || !liveVconn || !liveV->is_ready()) break;
 
                     try {
-                        v->send_audio_raw(reinterpret_cast<uint16_t*>(buffer.data()), bytesRead);
+                        liveV->send_audio_raw(reinterpret_cast<uint16_t*>(buffer.data()), bytesRead);
                     } catch (const std::exception& e) {
                         std::cerr << "[PlayAudioThread] send_audio_raw 예외: " << e.what() << std::endl;
                         break;

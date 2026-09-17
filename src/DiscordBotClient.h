@@ -9,7 +9,12 @@
 #include "FileLoader.h"
 
 struct GuildInfo {
-    dpp::voiceconn* vconn;
+    // voiceconn*을 캐싱하지 않는다 - dpp가 내부적으로 재연결(예: 음성 서버가 malformed frame을
+    // 보내서 하는 full reconnection)을 하면 이전 voiceconn/voiceclient 객체가 없어지고 새로
+    // 만들어질 수 있다. 캐싱된 포인터를 계속 쓰면 use-after-free로 세그폴트가 난다.
+    // 그래서 shard만 들고 있고, 실제 voiceconn은 필요할 때마다 shard->get_voice(guildId)로
+    // 매번 새로 조회한다.
+    dpp::discord_client* shard;
     VideoDbInfo currentPlay;
     std::vector<VideoDbInfo> videoLists;
     dpp::snowflake voiceChannelId;
@@ -19,10 +24,10 @@ struct GuildInfo {
     std::thread audioThread;
     std::mutex listMutex;
 
-    GuildInfo() : vconn(nullptr), voiceChannelId(0), skipRequested(false), shouldStop(false), repeatCurrent(false) {}
+    GuildInfo() : shard(nullptr), voiceChannelId(0), skipRequested(false), shouldStop(false), repeatCurrent(false) {}
 
-    GuildInfo(dpp::voiceconn* vconn, dpp::snowflake voiceChannelId)
-        : vconn(vconn), voiceChannelId(voiceChannelId), skipRequested(false), shouldStop(false), repeatCurrent(false) {}
+    GuildInfo(dpp::discord_client* shard, dpp::snowflake voiceChannelId)
+        : shard(shard), voiceChannelId(voiceChannelId), skipRequested(false), shouldStop(false), repeatCurrent(false) {}
 
     // 복사 생성자/대입 삭제 (스레드는 복사할 수 없음)
     GuildInfo(const GuildInfo&) = delete;
@@ -31,7 +36,7 @@ struct GuildInfo {
 
     // 이동 생성자: 모든 필드를 명시적으로 옮긴다 (currentPlay 포함 - 레거시에서 이 부분이 빠져있었음)
     GuildInfo(GuildInfo&& other) noexcept
-        : vconn(other.vconn),
+        : shard(other.shard),
           currentPlay(std::move(other.currentPlay)),
           videoLists(std::move(other.videoLists)),
           voiceChannelId(other.voiceChannelId),
