@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 #include "FileLoader.h"
 
 struct GuildInfo {
@@ -24,10 +25,17 @@ struct GuildInfo {
     std::thread audioThread;
     std::mutex listMutex;
 
-    GuildInfo() : shard(nullptr), voiceChannelId(0), skipRequested(false), shouldStop(false), repeatCurrent(false) {}
+    // 음성 연결이 끊긴 걸 감지한 뒤 마지막으로 자동 재접속을 시도한 시각.
+    // PlayAudioThread 자기 자신만 읽고 쓰므로 atomic이 아니어도 안전하다.
+    std::chrono::steady_clock::time_point lastReconnectAttempt;
+
+    GuildInfo()
+        : shard(nullptr), voiceChannelId(0), skipRequested(false), shouldStop(false), repeatCurrent(false),
+          lastReconnectAttempt(std::chrono::steady_clock::now()) {}
 
     GuildInfo(dpp::discord_client* shard, dpp::snowflake voiceChannelId)
-        : shard(shard), voiceChannelId(voiceChannelId), skipRequested(false), shouldStop(false), repeatCurrent(false) {}
+        : shard(shard), voiceChannelId(voiceChannelId), skipRequested(false), shouldStop(false), repeatCurrent(false),
+          lastReconnectAttempt(std::chrono::steady_clock::now()) {}
 
     // 복사 생성자/대입 삭제 (스레드는 복사할 수 없음)
     GuildInfo(const GuildInfo&) = delete;
@@ -43,7 +51,8 @@ struct GuildInfo {
           skipRequested(other.skipRequested.load()),
           shouldStop(other.shouldStop.load()),
           repeatCurrent(other.repeatCurrent.load()),
-          audioThread(std::move(other.audioThread)) {}
+          audioThread(std::move(other.audioThread)),
+          lastReconnectAttempt(std::chrono::steady_clock::now()) {}
 
     ~GuildInfo() {
         if (audioThread.joinable()) {

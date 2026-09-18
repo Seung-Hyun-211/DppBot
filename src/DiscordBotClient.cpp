@@ -524,6 +524,17 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
         dpp::discord_voice_client* v = (vconn && vconn->voiceclient) ? vconn->voiceclient.get() : nullptr;
 
         if (!vconn || !v || !v->is_ready()) {
+            // 음성 연결이 끊겼는데 자동으로 복구가 안 되는 경우(게이트웨이 재연결 여파 등)를
+            // 대비해, 5초 이상 끊긴 상태가 지속되면 마지막으로 접속해있던 채널로 재접속을
+            // 시도한다. 그전엔 정상적인 초기 연결 과정으로 오해해 재시도하지 않는다.
+            auto now = std::chrono::steady_clock::now();
+            if (shard && guildInfo->voiceChannelId != dpp::snowflake(0) &&
+                now - guildInfo->lastReconnectAttempt > std::chrono::seconds(5)) {
+                guildInfo->lastReconnectAttempt = now;
+                std::cout << "[PlayAudioThread] 음성 연결 끊김 감지, 채널 " << guildInfo->voiceChannelId
+                          << " 재접속 시도 (guild " << guildId << ")" << std::endl;
+                shard->connect_voice(guildId, guildInfo->voiceChannelId);
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
