@@ -82,15 +82,16 @@ void DiscordBotClient::HandleCommand(const std::string& command, const dpp::mess
 
 // ================= 서버 호출 =================
 
-GuildInfo& DiscordBotClient::EnsureGuildInfo(dpp::snowflake guildId, dpp::discord_client* shard) {
+GuildInfo& DiscordBotClient::EnsureGuildInfo(dpp::snowflake guildId, uint32_t shardId) {
     auto it = guildInfos.find(guildId);
     if (it != guildInfos.end()) {
         return it->second;
     }
 
+    dpp::discord_client* shard = bot.get_shard(shardId);
     dpp::voiceconn* vconn = shard ? shard->get_voice(guildId) : nullptr;
     dpp::snowflake voiceChannelId = (vconn && vconn->channel_id != dpp::snowflake(0)) ? vconn->channel_id : dpp::snowflake(0);
-    auto result = guildInfos.emplace(guildId, GuildInfo(shard, voiceChannelId));
+    auto result = guildInfos.emplace(guildId, GuildInfo(shardId, voiceChannelId));
     return result.first->second;
 }
 
@@ -125,10 +126,10 @@ void DiscordBotClient::RequestAndEnqueue(const std::string& query, const dpp::me
     bot.message_add_reaction(event.msg, "🔃");
 
     dpp::snowflake guildId = event.msg.guild_id;
-    dpp::discord_client* shard = event.from();
+    uint32_t shardId = event.from()->shard_id;
     std::string path = "/process?q=" + FileLoader::UrlEncode(query);
 
-    FileLoader::RequestServer(bot, path, [this, event, guildId, shard, insertFront](bool ok, nlohmann::json json, std::string err) {
+    FileLoader::RequestServer(bot, path, [this, event, guildId, shardId, insertFront](bool ok, nlohmann::json json, std::string err) {
         auto markFailed = [this, event]() {
             bot.message_delete_own_reaction(event.msg, "🔃", [this, event](const dpp::confirmation_callback_t& cb) {
                 if (!cb.is_error()) bot.message_add_reaction(event.msg, "❌");
@@ -173,7 +174,7 @@ void DiscordBotClient::RequestAndEnqueue(const std::string& query, const dpp::me
 
         {
             std::lock_guard<std::mutex> lock(guildInfosMutex);
-            GuildInfo& guildInfo = EnsureGuildInfo(guildId, shard);
+            GuildInfo& guildInfo = EnsureGuildInfo(guildId, shardId);
             std::lock_guard<std::mutex> listLock(guildInfo.listMutex);
             if (insertFront) {
                 guildInfo.videoLists.insert(guildInfo.videoLists.begin(), items.begin(), items.end());
@@ -215,10 +216,10 @@ void DiscordBotClient::HandleOmakaseCommand(const std::string& args, const dpp::
     bot.message_add_reaction(event.msg, "🔃");
 
     dpp::snowflake guildId = event.msg.guild_id;
-    dpp::discord_client* shard = event.from();
+    uint32_t shardId = event.from()->shard_id;
     std::string path = "/getrandom?count=" + std::to_string(count);
 
-    FileLoader::RequestServer(bot, path, [this, event, guildId, shard](bool ok, nlohmann::json json, std::string err) {
+    FileLoader::RequestServer(bot, path, [this, event, guildId, shardId](bool ok, nlohmann::json json, std::string err) {
         bool hasItems = ok && json.value("success", false) && json.contains("items") && json["items"].is_array();
         if (!hasItems) {
             std::string errMsg = ok ? json.value("error", std::string("응답에 items가 없습니다.")) : err;
@@ -233,7 +234,7 @@ void DiscordBotClient::HandleOmakaseCommand(const std::string& args, const dpp::
         int addedCount = 0;
         {
             std::lock_guard<std::mutex> lock(guildInfosMutex);
-            GuildInfo& guildInfo = EnsureGuildInfo(guildId, shard);
+            GuildInfo& guildInfo = EnsureGuildInfo(guildId, shardId);
             std::lock_guard<std::mutex> listLock(guildInfo.listMutex);
             for (const auto& item : json["items"]) {
                 VideoDbInfo info = FileLoader::ParseVideoDbInfo(item);
@@ -433,6 +434,10 @@ void DiscordBotClient::HandleJoinCommand(const dpp::message_create_t& event) {
         return;
     }
 
+    // shard 포인터는 게이트웨이 재연결 때 파괴/재생성되므로 들고 있지 않고, ID만 기억해서
+    // 쓸 때마다 bot.get_shard()로 현재 객체를 조회한다.
+    const uint32_t shardId = event.from()->shard_id;
+
     bool hadExistingConnection = false;
     {
         std::lock_guard<std::mutex> lock(guildInfosMutex);
@@ -444,9 +449,10 @@ void DiscordBotClient::HandleJoinCommand(const dpp::message_create_t& event) {
         // 스레드를 멈추기 전에 연결을 끊으면 use-after-free 위험이 있다.
         StopAudioThread(event.msg.guild_id);
 
-        // 캐싱된 값 대신 shard에서 지금 시점의 voiceconn을 다시 조회한다 (dpp가 그 사이
+        // 캐싱된 값 대신 지금 시점의 shard/voiceconn을 다시 조회한다 (dpp가 그 사이
         // 내부적으로 재연결하면서 이전 객체를 없앴을 수 있음).
-        dpp::voiceconn* existingVconn = event.from()->get_voice(event.msg.guild_id);
+        dpp::discord_client* shard = bot.get_shard(shardId);
+        dpp::voiceconn* existingVconn = shard ? shard->get_voice(event.msg.guild_id) : nullptr;
         if (existingVconn && existingVconn->voiceclient && existingVconn->voiceclient->is_ready()) {
             existingVconn->voiceclient->stop_audio();
             existingVconn->disconnect();
@@ -456,16 +462,19 @@ void DiscordBotClient::HandleJoinCommand(const dpp::message_create_t& event) {
         guildInfos.erase(event.msg.guild_id);
     }
 
-    event.from()->disconnect_voice(event.msg.guild_id);
+    if (dpp::discord_client* shard = bot.get_shard(shardId)) {
+        shard->disconnect_voice(event.msg.guild_id);
+    }
 
     if (g->connect_member_voice(bot, event.msg.author.id)) {
-        dpp::voiceconn* vconn = event.from()->get_voice(event.msg.guild_id);
+        dpp::discord_client* shard = bot.get_shard(shardId);
+        dpp::voiceconn* vconn = shard ? shard->get_voice(event.msg.guild_id) : nullptr;
         if (vconn) {
             dpp::snowflake voiceChannelId = (vconn->channel_id != dpp::snowflake(0)) ? vconn->channel_id : dpp::snowflake(0);
             {
                 std::lock_guard<std::mutex> lock(guildInfosMutex);
                 guildInfos.erase(event.msg.guild_id);
-                guildInfos.emplace(event.msg.guild_id, GuildInfo(event.from(), voiceChannelId));
+                guildInfos.emplace(event.msg.guild_id, GuildInfo(shardId, voiceChannelId));
             }
             StartAudioThread(event.msg.guild_id);
         }
@@ -477,6 +486,7 @@ void DiscordBotClient::HandleJoinCommand(const dpp::message_create_t& event) {
 
 void DiscordBotClient::HandleLeaveCommand(const dpp::message_create_t& event) {
     dpp::snowflake guildId = event.msg.guild_id;
+    const uint32_t shardId = event.from()->shard_id;
 
     {
         std::lock_guard<std::mutex> lock(guildInfosMutex);
@@ -494,7 +504,9 @@ void DiscordBotClient::HandleLeaveCommand(const dpp::message_create_t& event) {
     }
 
     try {
-        event.from()->disconnect_voice(guildId);
+        if (dpp::discord_client* shard = bot.get_shard(shardId)) {
+            shard->disconnect_voice(guildId);
+        }
     } catch (const std::exception& e) {
         std::cerr << "[HandleLeaveCommand] disconnect_voice 예외: " << e.what() << std::endl;
     }
@@ -519,7 +531,9 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
             guildInfo = &it->second;
         }
 
-        dpp::discord_client* shard = guildInfo->shard;
+        // shard 객체는 게이트웨이 재연결(resume) 때 파괴/재생성되므로 매번 ID로 다시 조회한다.
+        const uint32_t shardId = guildInfo->shardId;
+        dpp::discord_client* shard = bot.get_shard(shardId);
         dpp::voiceconn* vconn = shard ? shard->get_voice(guildId) : nullptr;
         dpp::discord_voice_client* v = (vconn && vconn->voiceclient) ? vconn->voiceclient.get() : nullptr;
 
@@ -593,7 +607,8 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
                     // 매 프레임마다 다시 조회한다. dpp가 내부적으로 음성 재연결(voiceconn 교체)을
                     // 하는 동안 바깥에서 캐싱해둔 포인터를 계속 쓰면 use-after-free로 세그폴트가
                     // 난다 - 실제로 "Starting a full reconnection" 로그 직후 크래시가 발생했었음.
-                    dpp::voiceconn* liveVconn = shard ? shard->get_voice(guildId) : nullptr;
+                    dpp::discord_client* liveShard = bot.get_shard(shardId);
+                    dpp::voiceconn* liveVconn = liveShard ? liveShard->get_voice(guildId) : nullptr;
                     dpp::discord_voice_client* liveV = (liveVconn && liveVconn->voiceclient) ? liveVconn->voiceclient.get() : nullptr;
                     if (!liveV || !liveVconn || !liveV->is_ready()) break;
 

@@ -10,12 +10,13 @@
 #include "FileLoader.h"
 
 struct GuildInfo {
-    // voiceconn*을 캐싱하지 않는다 - dpp가 내부적으로 재연결(예: 음성 서버가 malformed frame을
-    // 보내서 하는 full reconnection)을 하면 이전 voiceconn/voiceclient 객체가 없어지고 새로
-    // 만들어질 수 있다. 캐싱된 포인터를 계속 쓰면 use-after-free로 세그폴트가 난다.
-    // 그래서 shard만 들고 있고, 실제 voiceconn은 필요할 때마다 shard->get_voice(guildId)로
-    // 매번 새로 조회한다.
-    dpp::discord_client* shard;
+    // dpp 객체 포인터(voiceconn*, discord_client*)를 캐싱하지 않는다.
+    // - voiceconn: 음성 full reconnection 때 통째로 새로 만들어진다.
+    // - discord_client(shard): 게이트웨이 재연결(resume) 때 기존 객체를 복사해서 새 객체를 만들고
+    //   이전 객체는 파괴된다 (discord_client(discord_client& old) 생성자).
+    // 캐싱된 포인터를 계속 쓰면 use-after-free로 세그폴트가 나므로, 안정적인 shard ID(숫자)만
+    // 저장하고 쓸 때마다 bot.get_shard(shardId)로 현재 객체를 다시 조회한다.
+    uint32_t shardId;
     VideoDbInfo currentPlay;
     std::vector<VideoDbInfo> videoLists;
     dpp::snowflake voiceChannelId;
@@ -30,11 +31,11 @@ struct GuildInfo {
     std::chrono::steady_clock::time_point lastReconnectAttempt;
 
     GuildInfo()
-        : shard(nullptr), voiceChannelId(0), skipRequested(false), shouldStop(false), repeatCurrent(false),
+        : shardId(0), voiceChannelId(0), skipRequested(false), shouldStop(false), repeatCurrent(false),
           lastReconnectAttempt(std::chrono::steady_clock::now()) {}
 
-    GuildInfo(dpp::discord_client* shard, dpp::snowflake voiceChannelId)
-        : shard(shard), voiceChannelId(voiceChannelId), skipRequested(false), shouldStop(false), repeatCurrent(false),
+    GuildInfo(uint32_t shardId, dpp::snowflake voiceChannelId)
+        : shardId(shardId), voiceChannelId(voiceChannelId), skipRequested(false), shouldStop(false), repeatCurrent(false),
           lastReconnectAttempt(std::chrono::steady_clock::now()) {}
 
     // 복사 생성자/대입 삭제 (스레드는 복사할 수 없음)
@@ -44,7 +45,7 @@ struct GuildInfo {
 
     // 이동 생성자: 모든 필드를 명시적으로 옮긴다 (currentPlay 포함 - 레거시에서 이 부분이 빠져있었음)
     GuildInfo(GuildInfo&& other) noexcept
-        : shard(other.shard),
+        : shardId(other.shardId),
           currentPlay(std::move(other.currentPlay)),
           videoLists(std::move(other.videoLists)),
           voiceChannelId(other.voiceChannelId),
@@ -86,7 +87,7 @@ private:
     void RequestAndEnqueue(const std::string& query, const dpp::message_create_t& event, bool insertFront);
 
     // guildId에 대한 GuildInfo가 없으면 만든다. guildInfosMutex를 잠근 상태에서 호출해야 한다.
-    GuildInfo& EnsureGuildInfo(dpp::snowflake guildId, dpp::discord_client* shard);
+    GuildInfo& EnsureGuildInfo(dpp::snowflake guildId, uint32_t shardId);
 
     void PlayAudioThread(dpp::snowflake guildId);
     void StartAudioThread(dpp::snowflake guildId);
