@@ -17,6 +17,12 @@ constexpr uint32_t FRAME_DURATION_MS = 60;
 constexpr uint32_t SEND_INTERVAL_MS = 58;
 constexpr uint32_t LEAD_PER_FRAME_MS = FRAME_DURATION_MS - SEND_INTERVAL_MS;
 
+// 봇 말고 아무도 없는 상태가 이 시간 이상 지속되면 음성 채널에서 나간다.
+// 잠깐 튕겼다 돌아오는 경우를 넘기기 위한 유예 시간이다.
+constexpr std::chrono::seconds EMPTY_CHANNEL_GRACE(10);
+// 인원 확인 주기. 유예 시간보다 충분히 짧아야 실제 퇴장 시점이 유예 시간에 가깝다.
+constexpr uint64_t VOICE_CHECK_INTERVAL_SEC = 2;
+
 DiscordBotClient::DiscordBotClient(const std::string& token)
     : bot(token, dpp::i_all_intents)
 {
@@ -32,6 +38,13 @@ DiscordBotClient::DiscordBotClient(const std::string& token)
             HandleCommand(event.msg.content.substr(1), event);
         }
     });
+
+    bot.on_voice_state_update([this](const dpp::voice_state_update_t& event) {
+        OnVoiceStateUpdate(event);
+    });
+
+    // on_ready는 재연결 때 다시 호출될 수 있어서 타이머가 중복 등록되지 않도록 생성자에서 한 번만 등록한다.
+    bot.start_timer([this](dpp::timer) { CheckVoiceChannels(); }, VOICE_CHECK_INTERVAL_SEC);
 }
 
 void DiscordBotClient::run() {
@@ -47,6 +60,15 @@ void DiscordBotClient::HandleCommand(const std::string& command, const dpp::mess
         size_t spacePos = command.find(' ');
         return (spacePos != std::string::npos) ? command.substr(spacePos + 1) : "";
     };
+
+    // 자동 퇴장 안내 메시지를 보낼 채널을 기억해둔다.
+    {
+        std::lock_guard<std::mutex> lock(guildInfosMutex);
+        auto it = guildInfos.find(event.msg.guild_id);
+        if (it != guildInfos.end()) {
+            it->second.lastTextChannelId = event.msg.channel_id;
+        }
+    }
 
     if (lowerCommand == "join" || lowerCommand == "j") {
         HandleJoinCommand(event);
@@ -470,6 +492,9 @@ void DiscordBotClient::HandleJoinCommand(const dpp::message_create_t& event) {
         guildInfos.erase(event.msg.guild_id);
     }
 
+    // 인원 스냅샷을 새로 뜨도록 초기화 (이전 세션 동안 놓친 이벤트가 있어도 다시 맞춰진다).
+    ResetVoiceTracking(event.msg.guild_id);
+
     if (dpp::discord_client* shard = bot.get_shard(shardId)) {
         shard->disconnect_voice(event.msg.guild_id);
     }
@@ -482,7 +507,8 @@ void DiscordBotClient::HandleJoinCommand(const dpp::message_create_t& event) {
             {
                 std::lock_guard<std::mutex> lock(guildInfosMutex);
                 guildInfos.erase(event.msg.guild_id);
-                guildInfos.emplace(event.msg.guild_id, GuildInfo(shardId, voiceChannelId));
+                auto created = guildInfos.emplace(event.msg.guild_id, GuildInfo(shardId, voiceChannelId));
+                created.first->second.lastTextChannelId = event.msg.channel_id;
             }
             StartAudioThread(event.msg.guild_id);
         }
@@ -493,9 +519,10 @@ void DiscordBotClient::HandleJoinCommand(const dpp::message_create_t& event) {
 }
 
 void DiscordBotClient::HandleLeaveCommand(const dpp::message_create_t& event) {
-    dpp::snowflake guildId = event.msg.guild_id;
-    const uint32_t shardId = event.from()->shard_id;
+    LeaveVoice(event.msg.guild_id, event.from()->shard_id);
+}
 
+void DiscordBotClient::LeaveVoice(dpp::snowflake guildId, uint32_t shardId) {
     {
         std::lock_guard<std::mutex> lock(guildInfosMutex);
         auto it = guildInfos.find(guildId);
@@ -508,7 +535,7 @@ void DiscordBotClient::HandleLeaveCommand(const dpp::message_create_t& event) {
     try {
         StopAudioThread(guildId);
     } catch (const std::exception& e) {
-        std::cerr << "[HandleLeaveCommand] StopAudioThread 예외: " << e.what() << std::endl;
+        std::cerr << "[LeaveVoice] StopAudioThread 예외: " << e.what() << std::endl;
     }
 
     try {
@@ -516,11 +543,163 @@ void DiscordBotClient::HandleLeaveCommand(const dpp::message_create_t& event) {
             shard->disconnect_voice(guildId);
         }
     } catch (const std::exception& e) {
-        std::cerr << "[HandleLeaveCommand] disconnect_voice 예외: " << e.what() << std::endl;
+        std::cerr << "[LeaveVoice] disconnect_voice 예외: " << e.what() << std::endl;
     }
 
-    std::lock_guard<std::mutex> lock(guildInfosMutex);
-    guildInfos.erase(guildId);
+    {
+        std::lock_guard<std::mutex> lock(guildInfosMutex);
+        guildInfos.erase(guildId);
+    }
+    ResetVoiceTracking(guildId);
+}
+
+// ================= 음성 채널 인원 추적 / 자동 퇴장 =================
+
+void DiscordBotClient::OnVoiceStateUpdate(const dpp::voice_state_update_t& event) {
+    const dpp::voicestate& st = event.state;
+    if (st.guild_id == dpp::snowflake(0) || st.user_id == dpp::snowflake(0)) return;
+
+    const bool left = (st.channel_id == dpp::snowflake(0));
+    bool isBot = false;
+    if (!left) {
+        dpp::user* u = dpp::find_user(st.user_id);
+        isBot = (u != nullptr) && u->is_bot();   // 캐시에 없으면 사람으로 간주 (보수적)
+    }
+
+    std::lock_guard<std::mutex> lock(voiceMutex);
+    if (left) {
+        auto it = voiceOccupancy.find(st.guild_id);
+        if (it != voiceOccupancy.end()) it->second.erase(st.user_id);
+    } else {
+        VoiceMemberInfo info;
+        info.channelId = st.channel_id;
+        info.isBot = isBot;
+        voiceOccupancy[st.guild_id][st.user_id] = info;
+    }
+}
+
+// 이미 채널에 있던 사람들은 이벤트가 오지 않으므로 dpp 캐시에서 한 번만 스냅샷을 뜬다.
+// dpp가 voice_members를 락 없이 수정하기 때문에 이 접근은 길드당 세션마다 한 번으로 제한한다.
+void DiscordBotClient::EnsureVoiceSeeded(dpp::snowflake guildId) {
+    {
+        std::lock_guard<std::mutex> lock(voiceMutex);
+        if (seededVoiceGuilds.count(guildId)) return;
+    }
+
+    dpp::guild* g = dpp::find_guild(guildId);
+    if (!g) return;  // 길드가 아직 캐시에 없으면 판단을 미룬다 (섣불리 "비었다"고 결론내리지 않음)
+    std::map<dpp::snowflake, dpp::voicestate> snapshot = g->voice_members;
+
+    std::vector<std::pair<dpp::snowflake, VoiceMemberInfo>> entries;
+    for (const auto& entry : snapshot) {
+        if (entry.second.channel_id == dpp::snowflake(0)) continue;
+        dpp::user* u = dpp::find_user(entry.first);
+        VoiceMemberInfo info;
+        info.channelId = entry.second.channel_id;
+        info.isBot = (u != nullptr) && u->is_bot();
+        entries.emplace_back(entry.first, info);
+    }
+
+    std::lock_guard<std::mutex> lock(voiceMutex);
+    auto& members = voiceOccupancy[guildId];
+    for (const auto& e : entries) {
+        members.emplace(e.first, e.second);  // 이미 이벤트로 들어온 값이 더 최신이므로 덮어쓰지 않는다
+    }
+    seededVoiceGuilds.insert(guildId);
+}
+
+DiscordBotClient::VoiceObservation DiscordBotClient::ObserveVoice(dpp::snowflake guildId) {
+    VoiceObservation obs;
+    const dpp::snowflake botId = bot.me.id;
+
+    std::lock_guard<std::mutex> lock(voiceMutex);
+    if (botId == dpp::snowflake(0) || !seededVoiceGuilds.count(guildId)) return obs;
+    obs.known = true;
+
+    auto guildIt = voiceOccupancy.find(guildId);
+    if (guildIt == voiceOccupancy.end()) return obs;
+    const auto& members = guildIt->second;
+
+    auto botIt = members.find(botId);
+    if (botIt == members.end()) return obs;
+    obs.botPresent = true;
+
+    for (const auto& entry : members) {
+        if (entry.first == botId || entry.second.isBot) continue;
+        if (entry.second.channelId != botIt->second.channelId) continue;
+        obs.humans++;
+    }
+    return obs;
+}
+
+void DiscordBotClient::ResetVoiceTracking(dpp::snowflake guildId) {
+    std::lock_guard<std::mutex> lock(voiceMutex);
+    seededVoiceGuilds.erase(guildId);
+    voiceOccupancy.erase(guildId);
+}
+
+// 타이머(dpp 타이머 스레드)에서 주기적으로 호출된다. 오래 블로킹하면 안 되므로
+// 실제 퇴장 처리(스레드 join 등)는 별도 워커 스레드로 넘긴다.
+void DiscordBotClient::CheckVoiceChannels() {
+    struct Target {
+        dpp::snowflake guildId;
+        uint32_t shardId;
+    };
+
+    std::vector<Target> targets;
+    {
+        std::lock_guard<std::mutex> lock(guildInfosMutex);
+        for (const auto& entry : guildInfos) {
+            if (!entry.second.leavePending) {
+                targets.push_back({entry.first, entry.second.shardId});
+            }
+        }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (const Target& target : targets) {
+        EnsureVoiceSeeded(target.guildId);
+        const VoiceObservation obs = ObserveVoice(target.guildId);
+
+        dpp::snowflake textChannelId(0);
+        bool shouldLeave = false;
+        {
+            std::lock_guard<std::mutex> lock(guildInfosMutex);
+            auto it = guildInfos.find(target.guildId);
+            if (it == guildInfos.end() || it->second.leavePending) continue;
+            GuildInfo& info = it->second;
+
+            // 상태를 알 수 없거나(스냅샷 전), 봇 자신이 아직 안 보이거나(접속 직후), 사람이 있으면 초기화.
+            if (!obs.known || !obs.botPresent || obs.humans > 0) {
+                info.emptyTracking = false;
+                continue;
+            }
+
+            if (!info.emptyTracking) {
+                info.emptyTracking = true;
+                info.emptySince = now;
+                continue;
+            }
+
+            if (now - info.emptySince >= EMPTY_CHANNEL_GRACE) {
+                info.leavePending = true;
+                textChannelId = info.lastTextChannelId;
+                shouldLeave = true;
+            }
+        }
+
+        if (shouldLeave) {
+            std::cout << "[CheckVoiceChannels] 봇 외에 아무도 없어서 퇴장 (guild " << target.guildId << ")" << std::endl;
+            const dpp::snowflake guildId = target.guildId;
+            const uint32_t shardId = target.shardId;
+            std::thread([this, guildId, shardId, textChannelId]() {
+                LeaveVoice(guildId, shardId);
+                if (textChannelId != dpp::snowflake(0)) {
+                    SendBotMessage(textChannelId, "음성 채널에 아무도 없어서 나갈게요.");
+                }
+            }).detach();
+        }
+    }
 }
 
 // ================= 오디오 재생 스레드 =================
@@ -631,7 +810,11 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
                     waitTime += LEAD_PER_FRAME_MS;
                 }
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(waitTime));
+                // 남은 오디오가 다 재생되도록 기다린다. 퇴장/정지 중이면 연결을 곧 끊을 거라 필요 없고,
+                // 이 대기가 StopAudioThread의 join을 곡 후반일수록 몇 초씩 막았다.
+                if (!guildInfo->shouldStop.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(waitTime));
+                }
                 FileLoader::CloseAudioStream(pipe, filePathToPlay);
                 FileLoader::Cleanup(filePathToPlay);
             } else {

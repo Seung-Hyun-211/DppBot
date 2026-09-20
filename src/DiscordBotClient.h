@@ -2,6 +2,7 @@
 #include <dpp/dpp.h>
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -29,6 +30,12 @@ struct GuildInfo {
     // 음성 연결이 끊긴 걸 감지한 뒤 마지막으로 자동 재접속을 시도한 시각.
     // PlayAudioThread 자기 자신만 읽고 쓰므로 atomic이 아니어도 안전하다.
     std::chrono::steady_clock::time_point lastReconnectAttempt;
+
+    // 아래 필드들은 guildInfosMutex를 잡은 상태에서만 읽고 쓴다.
+    dpp::snowflake lastTextChannelId = dpp::snowflake(0);  // 마지막으로 명령어를 받은 텍스트 채널 (안내 메시지용)
+    bool emptyTracking = false;                            // 봇 말고 아무도 없는 상태가 지속되는지
+    std::chrono::steady_clock::time_point emptySince;      // 그 상태가 시작된 시각
+    bool leavePending = false;                             // 자동 퇴장 처리 중 (중복 실행 방지)
 
     GuildInfo()
         : shardId(0), voiceChannelId(0), skipRequested(false), shouldStop(false), repeatCurrent(false),
@@ -93,6 +100,29 @@ private:
     void StartAudioThread(dpp::snowflake guildId);
     void StopAudioThread(dpp::snowflake guildId);
 
+    // 오디오 스레드 정지 -> 음성 연결 해제 -> GuildInfo 삭제. !leave와 자동 퇴장이 공유한다.
+    // 스레드 join으로 블로킹될 수 있으니 dpp 이벤트/타이머 스레드에서 직접 부르지 않는다.
+    void LeaveVoice(dpp::snowflake guildId, uint32_t shardId);
+
+    // ---- 음성 채널 인원 추적 ----
+    // dpp의 guild->voice_members는 이벤트 스레드가 락 없이 수정하므로 다른 스레드에서 순회하면
+    // 크래시할 수 있다. 그래서 on_voice_state_update 이벤트로 우리 쪽 자료구조를 따로 유지하고
+    // (자체 뮤텍스로 보호), 타이머는 그것만 읽는다.
+    struct VoiceMemberInfo {
+        dpp::snowflake channelId;
+        bool isBot = false;
+    };
+    struct VoiceObservation {
+        bool known = false;       // 이 길드의 음성 상태를 알고 있는지 (스냅샷 완료 여부)
+        bool botPresent = false;  // 봇 자신이 어떤 음성 채널에 있는지
+        int humans = 0;           // 봇이 있는 채널의 봇 아닌 유저 수
+    };
+    void OnVoiceStateUpdate(const dpp::voice_state_update_t& event);
+    void EnsureVoiceSeeded(dpp::snowflake guildId);
+    VoiceObservation ObserveVoice(dpp::snowflake guildId);
+    void ResetVoiceTracking(dpp::snowflake guildId);
+    void CheckVoiceChannels();
+
     void SendBotMessage(const dpp::snowflake& msgChannelId, const std::string& message);
     void DeleteMessage(const dpp::snowflake& msgId, const dpp::snowflake& msgChannelId);
     void SendListMessage(dpp::snowflake channelId, dpp::snowflake guildId);
@@ -104,4 +134,9 @@ private:
     // 채널별 마지막 봇 메시지 ID (다음 메시지를 보낼 때 이전 것을 지우기 위함)
     std::map<dpp::snowflake, dpp::snowflake> lastBotMessages;
     std::mutex lastBotMessagesMutex;
+
+    // guildInfosMutex와 voiceMutex는 동시에 잡지 않는다 (락 순서 문제 방지).
+    std::mutex voiceMutex;
+    std::map<dpp::snowflake, std::map<dpp::snowflake, VoiceMemberInfo>> voiceOccupancy;  // guild -> (user -> 상태)
+    std::set<dpp::snowflake> seededVoiceGuilds;
 };
