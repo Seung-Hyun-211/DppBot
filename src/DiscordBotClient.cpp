@@ -9,6 +9,14 @@
 constexpr size_t FRAME_SIZE = 11520;         // 60ms 분량 (48000Hz * 2ch * 2byte * 0.06s)
 constexpr uint64_t SILENCE_DURATION_MS = 20;
 
+// 프레임(60ms 분량)을 실제 재생 속도보다 조금 빠르게 보내서 버퍼가 마르지 않게 한다.
+// 프레임마다 (60 - 58)ms 만큼 dpp 내부 버퍼에 오디오가 선행해서 쌓이고, 곡이 끝난 뒤에는
+// 그 누적량만큼 기다려서 남은 오디오가 다 재생된 뒤 다음 곡으로 넘어간다.
+// 전송 간격을 바꾸면 선행량도 자동으로 맞춰지도록 상수 하나에서 파생시킨다.
+constexpr uint32_t FRAME_DURATION_MS = 60;
+constexpr uint32_t SEND_INTERVAL_MS = 58;
+constexpr uint32_t LEAD_PER_FRAME_MS = FRAME_DURATION_MS - SEND_INTERVAL_MS;
+
 DiscordBotClient::DiscordBotClient(const std::string& token)
     : bot(token, dpp::i_all_intents)
 {
@@ -619,8 +627,8 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
                         break;
                     }
 
-                    std::this_thread::sleep_for(std::chrono::milliseconds(58));
-                    waitTime += 1;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(SEND_INTERVAL_MS));
+                    waitTime += LEAD_PER_FRAME_MS;
                 }
 
                 std::this_thread::sleep_for(std::chrono::milliseconds(waitTime));
