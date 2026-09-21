@@ -50,6 +50,15 @@ cd server && go build -o Go-Local .
 
 서버 API 사용법은 [server/README.md](server/README.md) 참고.
 
+## 크래시 진단 (리눅스)
+
+클라이언트가 세그폴트 등 치명적 시그널로 죽으면 스택 트레이스가 콘솔과 `crash-backtrace.log`에 남는다.
+`./run-all.sh`로 실행했다면 종료 직후 함수 이름으로 풀어서 자동으로 출력해준다. 나중에 직접 볼 때는:
+
+```bash
+./symbolize-crash.sh crash-backtrace.log
+```
+
 ## 문서
 
 - [DESIGN.md](DESIGN.md) — 아키텍처, 명령어, API 계약, 데이터 모델

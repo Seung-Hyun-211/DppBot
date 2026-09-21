@@ -3,6 +3,7 @@
 #endif
 #include "JsonReader.h"
 #include "DiscordBotClient.h"
+#include "CrashHandler.h"
 #include <iostream>
 #ifdef _WIN32
 #include <Windows.h>
@@ -14,6 +15,8 @@ int main()
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
+    InstallCrashHandler();
+
     try {
         std::string token = JsonReader::GetDiscordToken();
         if (token.empty()) {

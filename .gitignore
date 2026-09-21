@@ -26,6 +26,7 @@ server/Go-Local-linux
 
 # 실행 로그
 server.log
+crash-backtrace*.log
 
 # OS / 에디터
 .DS_Store

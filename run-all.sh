@@ -69,4 +69,24 @@ echo ""
 
 echo "[2/2] 클라이언트 시작"
 echo ""
+
+# 이번 실행의 크래시 백트레이스만 남도록 이전 로그는 옆으로 치워둔다.
+if [ -f crash-backtrace.log ]; then
+    mv -f crash-backtrace.log crash-backtrace.prev.log
+fi
+
+# 클라이언트가 시그널로 죽어도 뒤처리(백트레이스 출력)를 할 수 있도록 set -e를 잠깐 끈다.
+set +e
 LD_LIBRARY_PATH="$SCRIPT_DIR/vcpkg_installed/x64-linux/lib:$LD_LIBRARY_PATH" "$CLIENT_BIN"
+CLIENT_EXIT=$?
+set -e
+
+# 128 이상이면 시그널로 종료된 것 (139 = SIGSEGV, 134 = SIGABRT)
+if [ "$CLIENT_EXIT" -ge 128 ] && [ -s crash-backtrace.log ]; then
+    echo ""
+    echo "=== 클라이언트가 비정상 종료했습니다 (종료 코드 $CLIENT_EXIT). 크래시 백트레이스: ==="
+    ./symbolize-crash.sh crash-backtrace.log || true
+    echo "(원본: crash-backtrace.log)"
+fi
+
+exit "$CLIENT_EXIT"

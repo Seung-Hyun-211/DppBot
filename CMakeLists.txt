@@ -28,7 +28,14 @@ add_executable(dppTest
     src/main.cpp
     src/DiscordBotClient.cpp
     src/FileLoader.cpp
+    src/CrashHandler.cpp
 )
+
+# 크래시 백트레이스에 함수 이름/줄 번호가 나오도록 한다 (리눅스 등 비 MSVC).
+if(NOT MSVC)
+    target_compile_options(dppTest PRIVATE -g -fno-omit-frame-pointer)
+    set_target_properties(dppTest PROPERTIES ENABLE_EXPORTS ON)  # -rdynamic
+endif()
 
 target_link_libraries(dppTest PRIVATE
     dpp::dpp
