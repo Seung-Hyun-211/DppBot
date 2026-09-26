@@ -23,6 +23,33 @@ constexpr std::chrono::seconds EMPTY_CHANNEL_GRACE(10);
 // 인원 확인 주기. 유예 시간보다 충분히 짧아야 실제 퇴장 시점이 유예 시간에 가깝다.
 constexpr uint64_t VOICE_CHECK_INTERVAL_SEC = 2;
 
+// 음성 클라이언트가 재연결 중일 때 곡을 버리지 않고 기다려주는 최대 시간.
+constexpr std::chrono::seconds VOICE_RECOVERY_TIMEOUT(20);
+
+namespace {
+
+// dpp는 음성 웹소켓이 끊기면 1초 뒤 dpp 타이머 스레드에서, 같은 discord_voice_client 안의
+// Opus 인코더를 cleanup()으로 파괴했다가 setup()으로 다시 만든다 (voice/enabled/thread.cpp).
+// 그런데 send_audio_raw()는 그 인코더를 락 없이 쓰기 때문에 재연결 중에 호출하면 해제된
+// 메모리를 써서 힙이 깨진다 (SIGABRT: send_audio_raw 안의 free()가 힙 손상을 감지).
+//
+// 연결이 끊긴 순간(is_connected() == false, terminating == true)은 cleanup()보다 최소 1초
+// 앞서므로, 호출 직전에 세 조건을 매번 확인해서 재연결이 진행되는 동안에는 send 계열
+// 함수를 아예 부르지 않는다. 그러면 cleanup()이 돌 때 우리 스레드는 이미 함수 밖에 있다.
+bool IsVoiceClientSafeToSend(dpp::discord_voice_client* v) {
+    return v != nullptr && v->is_connected() && v->is_ready() && !v->terminating;
+}
+
+// 위 조건이 깨졌을 때 로그로 어떤 조건이 원인인지 보여주기 위한 문자열.
+std::string DescribeVoiceClientState(dpp::discord_voice_client* v) {
+    if (v == nullptr) return "voiceclient 없음";
+    return std::string("connected=") + (v->is_connected() ? "1" : "0") +
+           " ready=" + (v->is_ready() ? "1" : "0") +
+           " terminating=" + (v->terminating ? "1" : "0");
+}
+
+}  // namespace
+
 DiscordBotClient::DiscordBotClient(const std::string& token)
     : bot(token, dpp::i_all_intents)
 {
@@ -724,7 +751,7 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
         dpp::voiceconn* vconn = shard ? shard->get_voice(guildId) : nullptr;
         dpp::discord_voice_client* v = (vconn && vconn->voiceclient) ? vconn->voiceclient.get() : nullptr;
 
-        if (!vconn || !v || !v->is_ready()) {
+        if (!vconn || !IsVoiceClientSafeToSend(v)) {
             // 음성 연결이 끊겼는데 자동으로 복구가 안 되는 경우(게이트웨이 재연결 여파 등)를
             // 대비해, 5초 이상 끊긴 상태가 지속되면 마지막으로 접속해있던 채널로 재접속을
             // 시도한다. 그전엔 정상적인 초기 연결 과정으로 오해해 재시도하지 않는다.
@@ -791,19 +818,55 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
                     }
                     if (bytesRead % 2 != 0) bytesRead--;
 
-                    // 매 프레임마다 다시 조회한다. dpp가 내부적으로 음성 재연결(voiceconn 교체)을
-                    // 하는 동안 바깥에서 캐싱해둔 포인터를 계속 쓰면 use-after-free로 세그폴트가
-                    // 난다 - 실제로 "Starting a full reconnection" 로그 직후 크래시가 발생했었음.
-                    dpp::discord_client* liveShard = bot.get_shard(shardId);
-                    dpp::voiceconn* liveVconn = liveShard ? liveShard->get_voice(guildId) : nullptr;
-                    dpp::discord_voice_client* liveV = (liveVconn && liveVconn->voiceclient) ? liveVconn->voiceclient.get() : nullptr;
-                    if (!liveV || !liveVconn || !liveV->is_ready()) break;
+                    // 이 프레임을 보낼 수 있을 때까지 기다린다. 매번 shard/voiceconn을 다시 조회하고
+                    // (재연결 때 객체가 교체되므로), IsVoiceClientSafeToSend()가 참일 때만 호출한다.
+                    // 재연결 중이면 곡을 버리지 않고 같은 프레임을 든 채 VOICE_RECOVERY_TIMEOUT까지 기다린다.
+                    bool sent = false;
+                    bool giveUp = false;
+                    bool loggedWaiting = false;
+                    const auto waitStart = std::chrono::steady_clock::now();
+                    while (!sent) {
+                        if (guildInfo->shouldStop.load() || guildInfo->skipRequested.load()) break;
 
-                    try {
-                        liveV->send_audio_raw(reinterpret_cast<uint16_t*>(buffer.data()), bytesRead);
-                    } catch (const std::exception& e) {
-                        std::cerr << "[PlayAudioThread] send_audio_raw 예외: " << e.what() << std::endl;
+                        dpp::discord_client* liveShard = bot.get_shard(shardId);
+                        dpp::voiceconn* liveVconn = liveShard ? liveShard->get_voice(guildId) : nullptr;
+                        dpp::discord_voice_client* liveV =
+                            (liveVconn && liveVconn->voiceclient) ? liveVconn->voiceclient.get() : nullptr;
+
+                        if (IsVoiceClientSafeToSend(liveV)) {
+                            try {
+                                liveV->send_audio_raw(reinterpret_cast<uint16_t*>(buffer.data()), bytesRead);
+                                sent = true;
+                            } catch (const std::exception& e) {
+                                std::cerr << "[PlayAudioThread] send_audio_raw 예외: " << e.what() << std::endl;
+                                giveUp = true;
+                                break;
+                            }
+                        } else {
+                            if (!loggedWaiting) {
+                                loggedWaiting = true;
+                                std::cout << "[PlayAudioThread] 음성 클라이언트 재연결 중 - 프레임 전송 대기 ("
+                                          << DescribeVoiceClientState(liveV) << ")" << std::endl;
+                            }
+                            if (std::chrono::steady_clock::now() - waitStart > VOICE_RECOVERY_TIMEOUT) {
+                                std::cerr << "[PlayAudioThread] 음성 연결이 " << VOICE_RECOVERY_TIMEOUT.count()
+                                          << "초 안에 복구되지 않아 현재 곡을 포기합니다" << std::endl;
+                                giveUp = true;
+                                break;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        }
+                    }
+                    if (giveUp) {
+                        waitTime = 0;  // 죽은 연결에서 "남은 오디오가 재생되길" 기다릴 이유가 없다
                         break;
+                    }
+                    if (!sent) continue;  // 정지/스킵 요청으로 빠져나온 경우 - 루프 맨 위에서 처리한다
+
+                    if (loggedWaiting) {
+                        std::cout << "[PlayAudioThread] 음성 클라이언트 복구됨 - 재생 재개" << std::endl;
+                        // 기다리는 동안 dpp 쪽 버퍼가 비었거나 재연결로 초기화됐으므로 누적 선행량도 버린다.
+                        waitTime = 0;
                     }
 
                     std::this_thread::sleep_for(std::chrono::milliseconds(SEND_INTERVAL_MS));
@@ -832,7 +895,7 @@ void DiscordBotClient::PlayAudioThread(dpp::snowflake guildId) {
                 }
             }
         } else {
-            if (v && vconn && v->is_ready()) {
+            if (vconn && IsVoiceClientSafeToSend(v)) {
                 try {
                     v->send_silence(SILENCE_DURATION_MS);
                 } catch (const std::exception& e) {

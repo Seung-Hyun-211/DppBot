@@ -63,6 +63,7 @@ Discord ── (gateway/voice) ──> C++ 봇 클라이언트 (dpp)
 - 서버로 보내는 HTTP 요청(다운로드, 추천 조회 등)은 디스코드 이벤트 콜백 스레드를 블로킹하지 않는 워커 스레드/비동기 경로에서 수행한다. 콜백 스레드에서 동기 호출하면 응답이 오는 동안 다른 길드의 메시지 처리가 멈춘다.
 - 길드 상태 구조체를 이동(move)할 때는 재생 큐, 현재 재생 곡, 스레드 핸들을 포함한 **모든 필드**를 명시적으로 옮긴다. 필드 하나라도 빠지면 조용히 데이터가 사라진다.
 - **dpp 객체 포인터를 캐싱하지 않는다.** `voiceconn*`(음성 full reconnection 때 교체)과 `discord_client*`(게이트웨이 resume 때 복사·교체되고 이전 객체는 파괴)는 재연결 때 사라지므로, 안정적인 `shardId`만 저장하고 쓸 때마다 `bot.get_shard(shardId)` → `get_voice(guildId)`로 다시 조회한다.
+- **재연결 중인 `discord_voice_client`에 `send_audio_raw`/`send_silence`를 호출하지 않는다.** dpp는 음성 웹소켓이 끊기면 1초 뒤 타이머 스레드에서 같은 객체 안의 Opus 인코더를 `cleanup()`으로 파괴하고 `setup()`으로 다시 만드는데, `send_audio_raw`는 그 인코더를 락 없이 쓴다. 호출 직전에 `is_connected() && is_ready() && !terminating`을 매번 확인하고(`IsVoiceClientSafeToSend`), 아니면 같은 프레임을 들고 기다린다(최대 20초). 스택 트레이스로 확인된 실제 크래시 원인이다.
 - **dpp 캐시의 `guild->voice_members`를 반복 순회하지 않는다.** dpp 이벤트 스레드가 락 없이 수정한다. 인원 추적은 `on_voice_state_update`로 유지하는 자체 자료구조(자체 뮤텍스)를 쓰고, 캐시 접근은 세션당 스냅샷 한 번으로 제한한다. `guildInfosMutex`와 `voiceMutex`는 동시에 잡지 않는다.
 - 외부 프로세스(curl 등)를 셸 문자열 조립 + `popen`으로 실행하지 않는다. HTTP 클라이언트 라이브러리를 직접 쓰거나, 프로세스 실행이 꼭 필요하면 인자 배열을 그대로 전달하는 API(셸을 거치지 않는 방식)를 쓴다.
 
